@@ -36,6 +36,8 @@ extern "C" int nvrm_gpuva_alloc(struct NVRMGpuVaRequest *);
 extern "C" int nvrm_gpuva_map(struct NVRMGpuVaRequest *);
 extern "C" int nvrm_gpuva_free(struct NVRMGpuVaRequest *);
 extern "C" bool nvrm_query_vram_kb(NvU32 gpuId, NvU32 *pRamKb, NvU32 *pTotalKb, NvU32 *pStatus);
+extern "C" bool nvrm_query_gpu_profile(NvU32 gpuId, NvU32 *pArch, NvU32 *pImpl, NvU32 *pCls3d, NvU32 *pClsCompute,
+                                       NvU32 *pClsCopy, NvU32 *pClsEnc, NvU32 *pClsDec, NvU32 *pStatus);
 kern_return_t _start(kmod_info_t *ki, void *data);
 kern_return_t _stop(kmod_info_t *ki, void *data);
 KMOD_EXPLICIT_DECL(com.nullmoth.NVRM, "0.1", _start, _stop)
@@ -139,6 +141,7 @@ private:
     IOWorkLoop  *fWorkLoop = NULL;
     IOFilterInterruptEventSource *fIntSrc = NULL;
     void readBARs();
+    void publishGpuProfile();
     bool placeLargeBar1();
     bool interruptFilter(IOFilterInterruptEventSource *src);
     void interruptOccurred(IOInterruptEventSource *src, int count);
@@ -884,10 +887,12 @@ bool NVRM::placeLargeBar1()
 {
     static const UInt64 kBigBase = 0x10000000000ULL;
     static const UInt64 kHostWindowEnd = 0x3ffbfffffffULL;
-    // -nvrmsmallbar: leave BAR1 where the firmware put it, as on a card without Resizable BAR (most GTX 16). Lets a
-    // ReBAR card run the small-BAR paths (surface budget, copy path, private surface images) for testing and diagnosis.
-    { char nb[8] = { 0 };
-      if (PE_parse_boot_argn("-nvrmsmallbar", nb, sizeof nb)) { LOG("bar1: -nvrmsmallbar set — BAR1 left as IOPCIFamily placed it"); return false; } }
+    // -nvrmsmallbar: a 256 MB BAR1, as on a card without Resizable BAR (every GTX 16 and most Turing boards), placed by
+    // the same path as a large one. Lets a ReBAR card run the small-BAR paths (surface budget, copy path, scan-out model)
+    // for testing. It used to leave BAR1 to IOPCIFamily, which on a ReBAR card can leave BAR1 with no address at all
+    // (measured on an RTX 5060: the nub held BAR0 and BAR3 only), so the switch never showed a small BAR1.
+    bool smallBar = false;
+    { char nb[8] = { 0 }; smallBar = PE_parse_boot_argn("-nvrmsmallbar", nb, sizeof nb); }
     UInt32 cap = 0;
     for (UInt32 off = 0x100, n = 0; off >= 0x100 && off < 0x1000 && n < 64; n++) {
         UInt32 h = fPCI->extendedConfigRead32(off);
@@ -913,7 +918,12 @@ bool NVRM::placeLargeBar1()
     // 10-07 (RTX 3060, RTX 5080): both cards resized to 16 GB stopped during bring-up (GSP boot,
     // NVAccel start), and the same RTX 3060 runs the desktop at 8 GB. 8 GB is the size proven on hardware (RTX 5060, 3060).
     UInt64 newSize = 0;
-    if (bar1Size < (4ULL << 30)) {
+    if (smallBar) {
+        if (!rbCtlOff || !((rbSupported >> 8) & 1)) { LOG("bar1: -nvrmsmallbar set but the card cannot be sized to 256 MB (mask 0x%x) — not placing", rbSupported); return false; }
+        newSize = 256ULL << 20;
+        LOG("bar1: -nvrmsmallbar set — BAR1 %llu MB will be sized to 256 MB, as on a card without Resizable BAR", bar1Size >> 20);
+        bar1Size = newSize;
+    } else if (bar1Size < (4ULL << 30)) {
         for (int k = 13; k >= 12; k--) if (rbCtlOff && (rbSupported >> k) & 1) { newSize = 1ULL << (20 + k); break; }
         // Turing cards offer 64-256 MB only (sizes mask 0x1c0), and some firmware leaves them at 64 MB: a GTX 1630, a
         // GTX 1660 SUPER and an RTX 2060 in user logs, against 66 Turing boots at 256 MB. 64 MB holds four 1440p
@@ -922,9 +932,23 @@ bool NVRM::placeLargeBar1()
         // the same path that moves 64 MB cards to 8 GB.
         for (int k = 11; !newSize && k >= 0; k--)
             if (rbCtlOff && ((rbSupported >> k) & 1) && (1ULL << (20 + k)) > bar1Size) newSize = 1ULL << (20 + k);
-        if (!newSize) { LOG("bar1: BAR1 is %llu MB and the card offers no larger size — not placing", bar1Size >> 20); return false; }
-        LOG("bar1: BAR1 is %llu MB; will resize it to %llu MB", bar1Size >> 20, newSize >> 20);
-        bar1Size = newSize;
+        if (!newSize) {
+            // A 256 MB Turing / GTX 16 BAR1 the firmware placed over the boot screen: nothing to resize, but it still moves,
+            // at its own size, by the path below. Left in place it kept the copy path (no zero-copy flip, tearing,
+            // WindowServer waits; #215 #122 #196) and its VRAM shared addresses with the console. The same placement at
+            // 256 MB runs zero-copy flips (an RTX 5060 with -nvrmsmallbar: 1,058 flips, none refused for VRAM).
+            const UInt64 cur = ((UInt64)fPCI->configRead32(0x18) << 32) | (fPCI->configRead32(0x14) & ~0xFULL);
+            PE_Video cv; bzero(&cv, sizeof cv);
+            const UInt64 con = (getPlatform() && getPlatform()->getConsoleInfo(&cv) == kIOReturnSuccess) ? ((UInt64)cv.v_baseAddr & ~3ull) : 0;
+            if (!(con && cur && con >= cur && con < cur + bar1Size)) {
+                LOG("bar1: BAR1 is %llu MB, the card offers no larger size and the console is not inside it — not placing", bar1Size >> 20);
+                return false;
+            }
+            LOG("bar1: BAR1 is %llu MB with the console inside it (0x%llx) and no larger size — moving it at this size", bar1Size >> 20, con);
+        } else {
+            LOG("bar1: BAR1 is %llu MB; will resize it to %llu MB", bar1Size >> 20, newSize >> 20);
+            bar1Size = newSize;
+        }
     }
 
     UInt32 lo14 = fPCI->configRead32(0x14), lo1c = fPCI->configRead32(0x1c), hi20 = fPCI->configRead32(0x20);
@@ -939,6 +963,30 @@ bool NVRM::placeLargeBar1()
         if (!m) continue;
         if (m->getPhysicalAddress() == bar3Old) bar3Size = m->getLength();
         if (m->getPhysicalAddress() == (lo10 & ~0xFULL)) bar0 = m;
+    }
+    // A BAR1 the firmware already sized (>= 4 GB, nothing to resize) and placed above 4 GB - so not over the boot screen,
+    // which sits below 4 GB - with that aperture already in the nub is left exactly where it is. NVIDIA's own driver does
+    // the same: nv_resize_pcie_bars() returns without a config write when the BAR is already the requested size, and it
+    // never picks a base address itself. Moving such a BAR1 to the top of the host window broke RTX 4060/4070 laptops
+    // (GH #185, #205): the aperture list for the new address could not be built, RM saw a BAR0-only table and
+    // kbusVerifyBar2 failed (RmInitAdapter 0x24:0x72:1281).
+    if (!newSize) {
+        const UInt64 cur1 = ((UInt64)old18 << 32) | (lo14 & ~0xFULL);
+        bool inNub = false;
+        for (unsigned i = 0; mem && i < mem->getCount(); i++) {
+            IOMemoryDescriptor *m = OSDynamicCast(IOMemoryDescriptor, mem->getObject(i));
+            if (m && m->getPhysicalAddress() == cur1 && m->getLength() >= bar1Size) { inNub = true; break; }
+        }
+        // Only when the boot console is not inside this BAR1 (a hybrid laptop's boot screen on the iGPU, or no console):
+        // a console inside BAR1 is why the move exists - RM's VRAM would overlap what macOS still scans out (STABILITY S9).
+        PE_Video v; bzero(&v, sizeof v);
+        const UInt64 con = (getPlatform() && getPlatform()->getConsoleInfo(&v) == kIOReturnSuccess) ? ((UInt64)v.v_baseAddr & ~3ull) : 0;
+        const bool conInside = con && con >= cur1 && con < cur1 + bar1Size;
+        if (cur1 >= (4ULL << 30) && inNub && !conInside) {
+            LOG("bar1: BAR1 already %llu MB at 0x%llx (above 4 GB, in the nub, console 0x%llx outside it) - left in place, as NVIDIA's driver does",
+                bar1Size >> 20, cur1, con);
+            return true;
+        }
     }
     // 10-09 (RTX 5050, MacPro7,1 + npci=0x3000): the nub's apertures can be stale — they sit at 0x100000000+ while
     // config space and assigned-addresses agree on BAR0 0x40000000 / BAR3 0x46000000 — so neither lookup above hits
@@ -1049,7 +1097,18 @@ bool NVRM::placeLargeBar1()
     OSArray *arr = OSArray::withCapacity(memCount + 3);
     IODeviceMemory *m1 = IODeviceMemory::withRange(bar1Base, bar1Size), *m3 = IODeviceMemory::withRange(bar3Base, bar3Size);
     IODeviceMemory *m0 = bar0 ? NULL : IODeviceMemory::withRange(lo10 & ~0xFULL, bar0Size);
-    if (!arr || !m1 || !m3 || (!bar0 && !m0)) { LOG("bar1: placed in hardware but the aperture list could not be built (no memory)"); OSSafeReleaseNULL(arr); OSSafeReleaseNULL(m1); OSSafeReleaseNULL(m3); OSSafeReleaseNULL(m0); return false; }
+    if (!arr || !m1 || !m3 || (!bar0 && !m0)) {
+        // Put the hardware back as the read-back path above does: returning with BAR1/BAR3 moved but the nub's apertures
+        // unchanged left RM a table that no longer matched the card (NVIDIA's driver restores on every failure path).
+        LOG("bar1: placed in hardware but the aperture list could not be built (no memory) - restoring what IOPCIFamily left");
+        OSSafeReleaseNULL(arr); OSSafeReleaseNULL(m1); OSSafeReleaseNULL(m3); OSSafeReleaseNULL(m0);
+        fPCI->configWrite16(0x04, cmd & ~0x2);
+        rp->configWrite32(0x24, 0x0000fff0); rp->configWrite32(0x28, rp28); rp->configWrite32(0x2c, rp2c); rp->configWrite32(0x24, rp24);
+        if (newSize) fPCI->extendedConfigWrite32(rbCtlOff, rbCtlOld);
+        fPCI->configWrite32(0x14, lo14); fPCI->configWrite32(0x18, old18); fPCI->configWrite32(0x1c, lo1c); fPCI->configWrite32(0x20, hi20);
+        fPCI->configWrite16(0x04, cmd);
+        return false;
+    }
     arr->setObject(bar0 ? bar0 : m0); arr->setObject(m1); arr->setObject(m3);
     OSSafeReleaseNULL(m0);
     for (unsigned i = 0; i < memCount; i++) {
@@ -1066,13 +1125,66 @@ bool NVRM::placeLargeBar1()
     return true;
 }
 
+/*
+ * One per-generation profile for the whole macOS layer, published on the PCI device as "nvrm-gpu-profile" (NVIDIA's HAL
+ * idea: one driver, the chip's implementation chosen once at start). The plugin, the Vulkan driver's copy engine, the
+ * video libraries and the scan-out path read it instead of guessing from a device-id range, so behaviour proven on one
+ * generation is never carried onto another by accident.
+ *   scanout "static-bar1": BAR1 covers all of VRAM, so VRAM is mapped once (kbusIsStaticBar1Supported);
+ *           "by-handle":   a small BAR1 (Turing / GTX 16 / Ampere without Resizable BAR), so scan-out surfaces are read
+ *                          by the display engine by handle and the CPU maps only what it touches (nvidia-drm-fb.c).
+ */
+void NVRM::publishGpuProfile()
+{
+    NvU32 arch = 0, impl = 0, c3d = 0, ccomp = 0, ccopy = 0, cenc = 0, cdec = 0, st = 0;
+    if (!nvrm_query_gpu_profile(fNv.gpu_id, &arch, &impl, &c3d, &ccomp, &ccopy, &cenc, &cdec, &st)) {
+        LOG("gpu profile: the RM did not answer (status 0x%x) - no profile published, users fall back to device ids", (unsigned)st);
+        return;
+    }
+    const char *gen = "unknown", *pfx = "";
+    switch (arch) {
+        case 0x160: gen = (impl == 7 || impl == 8) ? "Turing GTX 16" : "Turing"; pfx = "TU"; break;
+        case 0x170: gen = "Ampere"; pfx = "GA"; break;
+        case 0x180: gen = "Hopper"; pfx = "GH"; break;
+        case 0x190: gen = "Ada"; pfx = "AD"; break;
+        case 0x1A0: case 0x1B0: gen = "Blackwell"; pfx = "GB"; break;
+    }
+    char chip[16];
+    /* TU116 = impl 8 and TU117 = impl 7; every other chip is <prefix>1<arch digit 0-2>0<impl> (GA106, AD104, GB206) */
+    if (arch == 0x160 && impl == 8) snprintf(chip, sizeof chip, "TU116");
+    else if (arch == 0x160 && impl == 7) snprintf(chip, sizeof chip, "TU117");
+    else snprintf(chip, sizeof chip, "%s%x%02x", pfx, arch == 0x1B0 ? 2 : 1, (unsigned)impl);
+    const UInt64 bar1 = fNv.bars[NV_GPU_BAR_INDEX_FB].size;
+    UInt64 vram = 0;
+    if (OSNumber *n = OSDynamicCast(OSNumber, fPCI->getProperty("VRAM,totalsize"))) vram = n->unsigned64BitValue();
+    const bool staticBar1 = vram && bar1 >= vram;
+    OSDictionary *d = OSDictionary::withCapacity(16);
+    if (!d) return;
+    auto num = [&](const char *k, UInt64 v, int bits) { if (OSNumber *o = OSNumber::withNumber(v, bits)) { d->setObject(k, o); o->release(); } };
+    auto str = [&](const char *k, const char *v) { if (OSString *o = OSString::withCString(v)) { d->setObject(k, o); o->release(); } };
+    num("arch", arch, 32); num("impl", impl, 32);
+    str("chip", chip); str("generation", gen);
+    num("class-3d", c3d, 32); num("class-compute", ccomp, 32); num("class-copy", ccopy, 32);
+    num("class-nvenc", cenc, 32); num("class-nvdec", cdec, 32);
+    num("bar1-mb", bar1 >> 20, 32); num("vram-mb", vram >> 20, 32);
+    str("scanout", staticBar1 ? "static-bar1" : "by-handle");
+    str("video-layout", arch >= 0x1A0 ? "blackwell" : "classic");
+    str("native-shaders", arch == 0x1B0 ? "sm_120" : "none");
+    fPCI->setProperty("nvrm-gpu-profile", d);
+    d->release();
+    LOG("gpu profile: %s %s, 3d 0x%x copy 0x%x nvenc 0x%x nvdec 0x%x, BAR1 %llu MB of %llu MB VRAM -> scanout %s",
+        gen, chip, (unsigned)c3d, (unsigned)ccopy, (unsigned)cenc, (unsigned)cdec, bar1 >> 20, vram >> 20,
+        staticBar1 ? "static-bar1" : "by-handle");
+}
+
 void NVRM::readBARs()
 {
     nv_state_t *nv = &fNv;
     char table[256]; unsigned tn = 0;
     unsigned count = fPCI->getDeviceMemoryCount();
-    unsigned curNvBar = 0;
-    for (unsigned idx = 0; idx < count && curNvBar < NV_GPU_NUM_BARS; idx++) {
+    unsigned curNvBar = 0, found = 0;
+    for (unsigned i = 0; i < NV_GPU_NUM_BARS; i++) { nv->bars[i].offset = 0; nv->bars[i].cpu_address = 0; nv->bars[i].size = 0; }
+    for (unsigned idx = 0; idx < count && found < NV_GPU_NUM_BARS; idx++) {
         IODeviceMemory *dm = fPCI->getDeviceMemoryWithIndex(idx);
         if (!dm) continue;
         UInt64 phys = dm->getPhysicalAddress();
@@ -1088,12 +1200,19 @@ void NVRM::readBARs()
             if (is64) bar++;
         }
         if (off == 0 || size == 0) { kprintf("NVRM-xnu: aperture idx %u phys 0x%llx size 0x%llx: %s — skipped\n", idx, phys, size, off == 0 ? "no BAR register matches" : "zero length"); continue; }
+        // Each aperture goes to the slot of its BAR register. Counting them in order put BAR3 in BAR1's slot whenever
+        // macOS gave BAR1 no address, and RM then failed in rm_init_adapter with nothing saying why.
+        curNvBar = off == 0x10 ? NV_GPU_BAR_INDEX_REGS : off == 0x14 ? NV_GPU_BAR_INDEX_FB : off == 0x1c ? NV_GPU_BAR_INDEX_IMEM : NV_GPU_NUM_BARS;
+        if (curNvBar >= NV_GPU_NUM_BARS || nv->bars[curNvBar].size) continue;
+        found++;
         nv->bars[curNvBar].offset      = off;
         nv->bars[curNvBar].cpu_address = phys;
         nv->bars[curNvBar].size        = size;
         tn += snprintf(table + tn, sizeof table - tn, "bar%u@0x%02x:0x%llx+0x%llx ", curNvBar, off, phys, size);
-        curNvBar++;
     }
+    if (!nv->bars[NV_GPU_BAR_INDEX_FB].size)
+        LOG("BAR1 (the VRAM window) has no address from macOS: the GPU cannot start. Enable \"Above 4G Decoding\" in the BIOS, "
+            "or turn Resizable BAR off if it is on and the board cannot map it");
     setProperty("nvrm-bars", table);
     kprintf("NVRM-xnu: BARS %s\n", table);
 }
@@ -1199,6 +1318,7 @@ IOReturn NVRM::go(uint32_t pass)
                     (unsigned)qst, (unsigned)ramKb);
             }
         }
+        publishGpuProfile();
         if (nvkms_xnu_load()) nvrm_display_publish(this, fNv.gpu_id);
     }
     return kIOReturnSuccess;

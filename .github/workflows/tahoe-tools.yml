@@ -2,7 +2,7 @@ name: Tahoe compatibility tools
 
 on:
   push:
-    branches: [codex/tahoe-compat-checks]
+    branches: [main, codex/tahoe-compat-checks]
   workflow_dispatch:
 
 permissions:

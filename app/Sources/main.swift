@@ -9,10 +9,10 @@ import WebKit
 import UniformTypeIdentifiers
 
 struct Package {
-    static let version = "2.0.4"
-    static let name = "nullmoth-nvidia-2.0.4.tar.gz"
-    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.0.4/nullmoth-nvidia-2.0.4.tar.gz")!
-    static let sha256 = "ae307a431cb0e964757c15ed68d090508e2d85d01160599fbe9b899ae9ccf81b"
+    static let version = "2.1.0"
+    static let name = "nullmoth-nvidia-2.1.0.tar.gz"
+    static let url = URL(string: "https://github.com/nullmoth/nvidia-macos-driver/releases/download/v2.1.0/nullmoth-nvidia-2.1.0.tar.gz")!
+    static let sha256 = "ee52792d8ae3fbeb0fca733627febb9580dc06a6ceeb3b444d8e96e6493e2831"
 }
 let uploadPage = URL(string: "https://nullmothsystems.com/#send")!
 let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NullMoth")
@@ -431,6 +431,7 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         case "usbWrite": usbWrite(b["sel"] as? [String: [String: Int]] ?? [:], efi: b["efi"] as? String ?? "auto")
         case "crashReport": crashReportFromWindow()
         case "sendLogs": sendLogs(sample: b["sample"] as? String ?? "")
+        case "gpumap": mapGPU()   // "Map my GPU" (experimental, opt-in)
         case "optionalDiagnostics": optionalDiagnostics()
         case "importDiagnosticReceipt": importDiagnosticReceipt()
         case "verbose": run(mode: "verbose", pkg: "", efi: b["efi"] as? String ?? "auto", extra: ["--verbose", (b["on"] as? Bool ?? false) ? "on" : "off"])
@@ -533,6 +534,60 @@ final class App: NSObject, NSApplicationDelegate, WKScriptMessageHandler, WKUIDe
         }
         let names = String(decoding: out, as: UTF8.self).split(separator: "\n").map(String.init).filter { !$0.isEmpty }
         return (names, "helper")
+    }
+
+    /// Runs a bundled tool with a time limit; the output and whether it was killed for running too long.
+    static func runBounded(_ exe: URL, _ args: [String], seconds: Double) -> (status: Int32, out: Data, timedOut: Bool) {
+        let p = Process(); p.executableURL = exe; p.arguments = args
+        let o = Pipe(); p.standardOutput = o; p.standardError = Pipe()
+        let done = DispatchSemaphore(value: 0); p.terminationHandler = { _ in done.signal() }
+        var out = Data(); let read = DispatchGroup()
+        do { try p.run() } catch { return (-1, Data(), false) }
+        DispatchQueue.global(qos: .userInitiated).async(group: read) { out = o.fileHandleForReading.readDataToEndOfFile() }
+        if done.wait(timeout: .now() + seconds) == .timedOut { p.terminate(); _ = read.wait(timeout: .now() + 2); return (-2, out, true) }
+        _ = read.wait(timeout: .now() + 2)
+        return (p.terminationStatus, out, false)
+    }
+
+    /// "Map my GPU" (experimental, opt-in): the measurements made by hand on the developer's RTX 5060, run on this Mac's
+    /// GPU so the next driver can be tuned for it. Each test is its own nullmoth-gpumap process with a time limit; nothing
+    /// on the Mac is changed. The result is saved as gpu-map-<time>.json in the log folder, and Send logs (which asks
+    /// first) uploads it with the logs.
+    func mapGPU() {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = Bundle.main.resourceURL!
+            var map: [String: Any] = ["kind": "gpu-map", "version": 1,
+                                      "app": Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?",
+                                      "driver": App.recordedDriverVersion(), "macos": ProcessInfo.processInfo.operatingSystemVersionString,
+                                      "date": ISO8601DateFormatter().string(from: Date())]
+            let tests = ["identity", "correct", "bench", "corpus"]
+            for (i, t) in tests.enumerated() {
+                DispatchQueue.main.async { self.send("gpumapStatus", ["text": "Measuring (\(i + 1) of \(tests.count + 1)): \(t)..."]) }
+                let r = App.runBounded(res.appendingPathComponent("nullmoth-gpumap"), [t], seconds: 90)
+                var entry: [String: Any] = ["exit": Int(r.status), "timedOut": r.timedOut]
+                if let j = try? JSONSerialization.jsonObject(with: r.out) as? [String: Any] { entry["result"] = j }
+                else { entry["raw"] = String(decoding: r.out.prefix(2000), as: UTF8.self) }
+                map[t] = entry
+            }
+            DispatchQueue.main.async { self.send("gpumapStatus", ["text": "Measuring (5 of 5): displays and driver state..."]) }
+            let sp = App.runBounded(URL(fileURLWithPath: "/usr/sbin/system_profiler"), ["SPDisplaysDataType", "-json", "-detailLevel", "mini"], seconds: 60)
+            if let j = try? JSONSerialization.jsonObject(with: sp.out) { map["displays"] = j }
+            let sc = App.runBounded(URL(fileURLWithPath: "/usr/sbin/sysctl"), ["debug"], seconds: 10)
+            map["driverCounters"] = String(decoding: sc.out, as: UTF8.self).split(separator: "\n")
+                .filter { $0.hasPrefix("debug.nvaccel") || $0.hasPrefix("debug.nvrm") || $0.hasPrefix("debug.nmx") }.map(String.init)
+            map["pci"] = App.scanMac(self.table)["gpus"] ?? []
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let file = logs.appendingPathComponent("gpu-map-\(stamp).json")
+            var ok = false
+            if let d = try? JSONSerialization.data(withJSONObject: map, options: [.prettyPrinted, .sortedKeys]) {
+                try? FileManager.default.createDirectory(at: logs, withIntermediateDirectories: true)
+                ok = (try? d.write(to: file, options: .atomic)) != nil
+            }
+            DispatchQueue.main.async {
+                self.send("gpumapStatus", ["text": ok ? "Done. Saved \(file.lastPathComponent); Send logs uploads it." : "Could not save the result.", "done": true])
+                if ok { self.sendLogs() }
+            }
+        }
     }
 
     static func rules() -> [String: Any] {

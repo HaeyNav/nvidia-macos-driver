@@ -923,7 +923,19 @@ impl Ctx {
     fn get_or_create(&mut self, op: Op, result_type: Option<Word>, operands: Vec<Operand>) -> Word {
         let key = (op, result_type, operands.clone());
         if let Some(&id) = self.struct_cache.get(&key) {
-            return id;
+            // A cleanup between passes can drop an unused global this cache still names (a ConstantNull the NaN-to-zero
+            // conversion then selected: "owned Select references undefined id", Blender's light-probe kernel). Hand an id
+            // out only while it is still defined.
+            if self
+                .module
+                .types_global_values
+                .iter()
+                .chain(self.new_globals.iter())
+                .any(|inst| inst.result_id == Some(id))
+            {
+                return id;
+            }
+            self.struct_cache.remove(&key);
         }
         let mut highest_definition = 0;
         let mut existing = None;
@@ -2934,6 +2946,7 @@ pub(crate) fn transform_with_options_and_sidecar(
         .collect::<HashSet<_>>();
     crate::native::eliminate_dead_pointer_values_module(&mut ctx.module, &preserved_pointer_facts);
     crate::native::construct_workgroup_atomic_floats_module(&mut ctx.module);
+    crate::native::construct_atomic_storage_image_formats_module(&mut ctx.module);
     crate::native::close_private_vector_word_views_module(&mut ctx.module);
     if let Some(address_table) =
         crate::native::construct_interface_cross_binding_pointer_phis_module(

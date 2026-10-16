@@ -4,7 +4,20 @@ This fork branch starts at upstream `b737dedc11fa4edbcb4abe8d51e94cebfed21ac6`
 (2.0.4). The original fork head, `cd8e2bb04da48d2fa70cf1895879608f3588dbfb`,
 is an ancestor 142 commits behind that revision. Security, sleep/wake and
 Tahoe runtime changes in those commits are upstream work, not new fixes by
-this fork. The fork's main branch is not modified.
+this fork. These initial changes were prepared on a separate development branch.
+
+## Integration with upstream 2.1.0
+
+On 2026-10-16, upstream main and release v2.1.0 pointed to
+`277a29bea10371a88c4c1fb104409060d31962e8`, 20 commits beyond the original
+2.0.4 base. Those upstream updates are combined with this fork's changes
+for integration into the fork's main branch, preserving both histories.
+The upstream update did not modify any of the five fork-specific files.
+The Tahoe tools workflow now also runs on pushes to main.
+
+The binary validation below remains evidence for the 2.0.4 binaries only.
+Syncing source does not build a new driver or validate the 2.1.0 binaries
+on NVIDIA/Tahoe hardware.
 
 ## Changes made here
 

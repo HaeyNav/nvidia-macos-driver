@@ -2521,6 +2521,9 @@ static void nvmtl_sample_counter(NVMTLCommandBuffer *cb, id sb, NSUInteger i, id
 }
 
 unsigned nvmtl_apps1_resolve_miss, nvmtl_apps1_resolve_extra, nvmtl_apps1_ds_resolve_miss;
+@interface NVMTLRenderCommandEncoder () { unsigned _groupDepth, _dumpDepth; NSString *_dumpName; BOOL _dumpPso; }
+- (void)nvmtlDumpBoundFragmentBuffers;
+@end
 @implementation NVMTLRenderCommandEncoder
 - (NSUInteger)tileWidth { return 0; }
 - (NSUInteger)tileHeight { return 0; }
@@ -2718,8 +2721,16 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
         if (sa.texture && nvmtl_load_keeps(sa.loadAction)) load |= NVMTL_LOAD_STENCIL;
     }
     _pass.clear_depth = (float)da.clearDepth; _pass.clear_stencil = sa.clearStencil;
-    if (!any) { nvlog("encoder: apps2 a render pass with no attachments (%lux%lu) is not carried yet — nothing is drawn",
-                      (unsigned long)d.renderTargetWidth, (unsigned long)d.renderTargetHeight); return NO; }
+    if (!any) {
+        // A pass with no attachments: the fragment shader writes through images or buffers only, sized by the descriptor's
+        // renderTargetWidth/Height (Blender Eevee's shadow pages, 8192x8192 with image atomics). Vulkan draws it as a render
+        // pass with no attachments and a framebuffer of that size. Refusing it crashed Blender on its first shadowed frame
+        // (#152). Metal requires the size for such a pass, so a pass without one is still refused.
+        if (!d.renderTargetWidth || !d.renderTargetHeight) {
+            nvlog("encoder: apps2 a render pass with no attachments and no renderTargetWidth/Height — pass REFUSED"); return NO; }
+        w = (uint32_t)d.renderTargetWidth; h = (uint32_t)d.renderTargetHeight;
+        static int said; if (said++ < 4) nvlog("encoder: render pass with no attachments, %ux%u (writes through images/buffers only)", w, h);
+    }
     if (d.renderTargetWidth && d.renderTargetWidth < w) w = (uint32_t)d.renderTargetWidth;
     if (d.renderTargetHeight && d.renderTargetHeight < h) h = (uint32_t)d.renderTargetHeight;
     _pass.load = _load = load; _pass.w = w; _pass.h = h; _pass.layers = NL;
@@ -2756,6 +2767,14 @@ static NSDictionary *nvmtl_pixel_sampler_norm(NSDictionary *m) {
     if (!_hasRef) { nvmtl_vk_cmd_set_stencil_ref(&_cb->_c, 0, 0); _hasRef = YES; }
 }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)ps {
+    // NVMTL_DUMP_PSO=<text>: the first encoder that sets a pipeline whose label contains it has the fragment buffers bound
+    // at its end dumped, as NVMTL_DUMP_GROUP does, for apps that label pipelines but push no debug groups (diagnostic)
+    { static const char *want; static int once; static _Atomic int armed; if (!once) { once = 1; want = getenv("NVMTL_DUMP_PSO"); }
+      NSString *lbl = ps.label;
+      if (want && !strcmp(want, "?") && lbl) { static NSMutableSet *seen; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+          pthread_mutex_lock(&mu); if (!seen) seen = [NSMutableSet new]; BOOL n = ![seen containsObject:lbl]; if (n) [seen addObject:lbl];
+          pthread_mutex_unlock(&mu); if (n) nvlog("NVMTL_DUMP_PSO: pipeline label %s", lbl.UTF8String); }
+      if (want && *want && lbl && strstr(lbl.UTF8String ?: "", want) && !atomic_exchange(&armed, 1)) { _dumpPso = YES; _dumpName = [lbl copy]; } }
     { NVMTLRenderPipelineState *p_ = (NVMTLRenderPipelineState *)ps;
       if (p_ && nvmtl_trace_on()) {
           extern int nvmtl_vk_pipeline_stats(void *pipe, char *out, size_t n);
@@ -2920,6 +2939,14 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     else {
     if (nvmtl_vk_bind_texture_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, [nt nvsampleview])) nvlog("setFragmentTexture: bind FAILED");
     nvmtl_vk_bind_storage_view(&_cb->_c, NVMTL_SET_FRAGMENT, (uint32_t)i, nt->_stex ? [nt nvview] : NULL);
+    if (!nt->_stex && (nt.usage & MTLTextureUsageShaderWrite)) {
+        // a fragment shader writing a texture that has no storage view writes the dummy: say which texture, once per shape
+        static NSMutableSet *seen; static os_unfair_lock sl = OS_UNFAIR_LOCK_INIT;
+        NSString *k = [NSString stringWithFormat:@"%lu/%lu/%lu", (unsigned long)nt.pixelFormat, (unsigned long)nt.usage, (unsigned long)nt.textureType];
+        os_unfair_lock_lock(&sl); if (!seen) seen = [NSMutableSet new]; BOOL fresh = ![seen containsObject:k]; if (fresh) [seen addObject:k]; os_unfair_lock_unlock(&sl);
+        if (fresh) nvlog("setFragmentTexture: texture %lu is ShaderWrite but has no storage view (pixelFormat %lu, usage 0x%lx, type %lu, image storage %u) - a fragment write to it goes to the dummy",
+                         (unsigned long)i, (unsigned long)nt.pixelFormat, (unsigned long)nt.usage, (unsigned long)nt.textureType, [nt nvi]->storage);
+    }
     }
 }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count
@@ -3052,6 +3079,7 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
 }
 - (void)endEncoding {
     _cb->_nEnd++;
+    if (_dumpPso) { _dumpPso = NO; [self nvmtlDumpBoundFragmentBuffers]; }
     [self nvmtlCloseVisibility];
     if (_begun) nvmtl_vk_cmd_end_render(&_cb->_c);
     NSMutableDictionary *groups = [NSMutableDictionary new];
@@ -3317,8 +3345,40 @@ static NVMTLBuffer *nvmtl_bytes_ring(NVMTLCommandBuffer *cb, NSUInteger len, siz
     if ([self nvmtlVertexInputs]) return;
     nvmtl_vk_cmd_draw_indexed_indirect(&_cb->_c, &ni->_b, ioff, it == MTLIndexTypeUInt32, &nb->_b, off);
 }
-- (void)pushDebugGroup:(NSString *)g {}
-- (void)popDebugGroup {}
+- (void)pushDebugGroup:(NSString *)g {
+    nvtrace("GROUP %s", g.UTF8String ?: "?");
+    // NVMTL_SKIP_GROUP=<text>: draws inside a debug group whose name contains it are not recorded (finds a hanging shader)
+    static const char *skip; static int once; if (!once) { once = 1; skip = getenv("NVMTL_SKIP_GROUP"); }
+    _groupDepth++;
+    if (skip && *skip && !_cb->_c.skip_group && strstr(g.UTF8String ?: "", skip)) { _cb->_c.skip_group = _groupDepth; nvlog("NVMTL_SKIP_GROUP: skipping %s", g.UTF8String); }
+    // NVMTL_DUMP_GROUP=<text>: the first time a debug group containing it opens, the fragment buffers bound at that moment
+    // are copied out after this command buffer completes, up to 64 KB each, to $TMPDIR/dump-f<index>.bin (diagnostic)
+    static const char *dump; static int donce; static _Atomic int dumped; if (!donce) { donce = 1; dump = getenv("NVMTL_DUMP_GROUP"); }
+    if (dump && *dump && strstr(g.UTF8String ?: "", dump) && !atomic_exchange(&dumped, 1)) { _dumpDepth = _groupDepth; _dumpName = [g copy]; }
+}
+- (void)nvmtlDumpBoundFragmentBuffers {
+    {
+        NSDictionary *bound = [_fbufAt copy]; NSString *name = _dumpName;
+        [_cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                id<MTLDevice> dev = done.device; id<MTLCommandQueue> q = [dev newCommandQueue]; id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder]; NSMutableDictionary *outs = [NSMutableDictionary new];
+                for (NSNumber *k in bound) { NVMTLBuffer *b = bound[k][0]; NSUInteger off = [bound[k][1] unsignedLongValue];
+                    if (off >= b.length) continue; NSUInteger n = MIN(b.length - off, (NSUInteger)65536);
+                    id<MTLBuffer> o = [dev newBufferWithLength:n options:MTLResourceStorageModeShared];
+                    [be copyFromBuffer:b sourceOffset:off toBuffer:o destinationOffset:0 size:n]; outs[k] = o; }
+                [be endEncoding]; [cb commit]; [cb waitUntilCompleted];
+                for (NSNumber *k in outs) { id<MTLBuffer> o = outs[k];
+                    NSString *path = [NSTemporaryDirectory() stringByAppendingFormat:@"dump-f%@.bin", k];
+                    [[NSData dataWithBytes:o.contents length:o.length] writeToFile:path atomically:YES]; }
+                nvlog("NVMTL_DUMP_GROUP: %lu fragment buffer(s) of '%s' written to %s (command buffer status %ld)", (unsigned long)outs.count,
+                      name.UTF8String, NSTemporaryDirectory().UTF8String, (long)done.status);
+            });
+        }];
+    }
+}
+- (void)popDebugGroup { if (_dumpDepth && _dumpDepth == _groupDepth) { [self nvmtlDumpBoundFragmentBuffers]; _dumpDepth = 0; }
+    if (_cb->_c.skip_group == _groupDepth) _cb->_c.skip_group = 0; if (_groupDepth) _groupDepth--; }
 - (void)insertDebugSignpost:(NSString *)s {}
 - (void)setLabel:(NSString *)l { _label = [l copy]; }
 - (NSString *)label { return _label; }
@@ -4406,7 +4466,7 @@ static void nvmtl_zprobe_drain(void) {
 - (void)waitForFence:(id<MTLFence>)f { nvmtl_vk_cmd_barrier(&_cb->_c); }
 - (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained [])r count:(NSUInteger)n {
     if (nvmtl_g79_on(NVMTL_G79_BAR)) { _g79Bar = YES; nvmtl_g79_count(G79C_BARLAZY); } else nvmtl_vk_cmd_barrier(&_cb->_c); }
-- (void)pushDebugGroup:(NSString *)g {}
+- (void)pushDebugGroup:(NSString *)g { nvtrace("GROUP %s", g.UTF8String ?: "?"); }
 - (void)popDebugGroup {}
 - (void)insertDebugSignpost:(NSString *)sp {}
 - (void)endEncoding {
@@ -4619,7 +4679,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 }
 - (void)updateFence:(id<MTLFence>)f {}
 - (void)waitForFence:(id<MTLFence>)f { nvmtl_vk_cmd_barrier(&_cb->_c); }
-- (void)pushDebugGroup:(NSString *)g {}
+- (void)pushDebugGroup:(NSString *)g { nvtrace("GROUP %s", g.UTF8String ?: "?"); }
 - (void)popDebugGroup {}
 - (void)insertDebugSignpost:(NSString *)s {}
 - (void)synchronizeResource:(id<MTLResource>)r {
@@ -4791,7 +4851,7 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     [self nvmtlRecordDrawable:drawable presentation:^{ [drawable presentAfterMinimumDuration:d]; }];
 }
 
-- (void)pushDebugGroup:(NSString *)g {}
+- (void)pushDebugGroup:(NSString *)g { nvtrace("GROUP %s", g.UTF8String ?: "?"); }
 - (void)popDebugGroup {}
 - (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordSignal:e value:v]; }
 - (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordWait:e value:v]; }
@@ -4803,10 +4863,18 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
     static int ws = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
     [self commit];
-    if (ws) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    // nvmtl_ws_kernel_waits: the swap waits for this composite in NVAccel instead (nvmtl_ws_mark_pending at commit)
+    if (ws && !nvmtl_ws_kernel_waits()) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
-- (void)commit { [self nvmtlSubmitWithEvents]; }
+- (void)commit {
+    [self nvmtlSubmitWithEvents];
+    // NVMTL_DEBUG_WAIT_EACH=1: every command buffer is waited for and its completion traced, so a GPU hang is pinned to
+    // the command buffer (and the debug groups traced before it) that never finished. A diagnostic: it serialises the app.
+    static int each = -1; if (each < 0) { const char *e = getenv("NVMTL_DEBUG_WAIT_EACH"); each = e && e[0] == '1'; }
+    if (each) { static _Atomic unsigned long n; const unsigned long k = ++n; nvtrace("CB commit #%lu %s", k, _label.UTF8String ?: "");
+        [self waitUntilCompleted]; nvtrace("CB done #%lu status %ld", k, (long)self.status); }
+}
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder {
     NVMTLComputeCommandEncoder *e = [NVMTLComputeCommandEncoder new]; e->_cb = self; _nEnc++; return e;
 }
@@ -5246,7 +5314,7 @@ static int nvp_fast_off(void) {
     _desc.stencilAttachment.storeActionOptions = o;
 }
 - (void)insertDebugSignpost:(NSString *)s {}
-- (void)pushDebugGroup:(NSString *)g {}
+- (void)pushDebugGroup:(NSString *)g { nvtrace("GROUP %s", g.UTF8String ?: "?"); }
 - (void)popDebugGroup {}
 @end
 

@@ -25,6 +25,9 @@ mod relooper;
 mod render;
 mod rewrites;
 mod vec_scalar_merge;
+mod atomic_image_format;
+mod copy_memory_logical;
+mod stencil_export;
 mod wg_atomic;
 
 mod tir;
@@ -119,6 +122,8 @@ pub(crate) use rewrites::{
     construct_interface_cross_binding_pointer_merges_module,
     construct_interface_cross_binding_pointer_phis_module,
     construct_interface_cross_binding_pointer_values_module, construct_opaque_image_selects_module,
+    construct_atomic_storage_image_formats_module,
+    split_mismatched_copy_memory_module,
     construct_physical_atomic_pointer_lvalues_module, construct_workgroup_atomic_floats_module,
     eliminate_dead_pointer_values_module, eliminate_dead_values_module,
     lower_unobserved_bda_aggregate_pointer_fields_module, prune_constant_branches_module,
@@ -181,4 +186,14 @@ pub(crate) fn requires_device_address_model_for_source(
     let san_ll = inline::inline_pointer_select_consumers(&san_ll, entry).source;
     ir::LlModule::parse_with_stage_meta(&san_ll, kern, entry)
         .is_ok_and(|parsed| emit_tiers::requires_device_address_model(&parsed))
+}
+
+/// See inline::inline_and_forward_object_fields: the retry form of a module that failed as written.
+pub(crate) fn inline_and_forward_object_fields(san_ll: &str) -> Option<String> {
+    inline::inline_and_forward_object_fields(san_ll)
+}
+
+/// See stencil_export: a fragment stencil export lowered to a per-bit discard the driver replays.
+pub(crate) fn lower_stencil_export_module(module: &mut crate::spirv_module::Module) -> bool {
+    stencil_export::lower_stencil_export(module)
 }

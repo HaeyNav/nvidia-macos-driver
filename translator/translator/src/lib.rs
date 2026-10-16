@@ -837,6 +837,13 @@ pub fn translate_native_no_retry_constructed_with_options(
             Err(failure.error)
         }
     };
+    // the inline retry builds its buffers raw first: on Blender Eevee's deferred light shader the typed construction of
+    // the inlined module validated and rendered black, the raw one lit the scene as the reference GPU does
+    if raw_buffers_first_on() {
+        if let Ok(finished) = rc.construct_raw() {
+            return Ok(finished.bytes);
+        }
+    }
     let constructed = match primary {
         Ok(finished) => finished,
         Err(emit_err) if rc.needs_raw_construction() => {
@@ -1118,6 +1125,8 @@ fn finish_module(
     native::construct_cfg_functions_module(&mut out, &cfg_construction_functions)
         .map_err(FinishFailure::cfg)?;
     native::construct_physical_atomic_pointer_lvalues_module(&mut out);
+    native::split_mismatched_copy_memory_module(&mut out);
+    native::lower_stencil_export_module(&mut out);
     passes::drop_unreferenced_global_variables(&mut out);
     native::prune_unused_null_and_undef_constants_module(&mut out);
     if construction == FinishConstruction::RawRelooper {
@@ -1732,4 +1741,41 @@ entry:
             "reflection must analyze the finished owned module without parsing output bytes"
         );
     }
+}
+
+/// The retry form of an AIR module that failed as written: every internal call inlined and pointer fields of local objects
+/// forwarded (see native::inline). None when it would not change the module.
+pub fn inline_and_forward_object_fields(ll: &str) -> Option<String> {
+    native::inline_and_forward_object_fields(ll)
+}
+
+thread_local! {
+    static ARGBUF_SAMPLERS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with samplers held in argument buffers read through the sampler heap (the plugin's binding 1), as the retry of
+/// a module that failed without it does. Off otherwise: on by default it took over sampler operands three app modules
+/// already translated another way (measured on a 12,446-shader corpus).
+pub fn with_argument_buffer_samplers<R>(f: impl FnOnce() -> R) -> R {
+    ARGBUF_SAMPLERS.with(|c| c.set(true));
+    RAW_BUFFERS_FIRST.with(|c| c.set(true));
+    let r = f();
+    ARGBUF_SAMPLERS.with(|c| c.set(false));
+    RAW_BUFFERS_FIRST.with(|c| c.set(false));
+    r
+}
+
+thread_local! {
+    static RAW_BUFFERS_FIRST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Inside the inline retry (with_argument_buffer_samplers), every buffer is built raw before the typed construction is
+/// tried; outside it the typed construction comes first, as it always has.
+pub(crate) fn raw_buffers_first_on() -> bool {
+    RAW_BUFFERS_FIRST.with(|c| c.get())
+}
+
+pub(crate) fn argument_buffer_samplers_on() -> bool {
+    ARGBUF_SAMPLERS.with(|c| c.get())
+        || matches!(std::env::var("NVMTL_ARGBUF_SAMPLERS").as_deref(), Ok("1"))
 }
