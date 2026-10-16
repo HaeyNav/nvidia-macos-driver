@@ -66,8 +66,14 @@ review the interface; a successful link alone is insufficient.
   matched the original reader's result. Wrapping each binary in synthetic
   FAT32 and FAT64 containers produced exactly the same decoded tables.
   The containers test slice extraction; they are not new driver builds.
-- The GitHub workflow has been prepared but has not run. Neither a full
-  driver build nor a Tahoe boot/render/sleep test was performed.
+- [GitHub Actions run 38909447175](https://github.com/HaeyNav/nvidia-macos-driver/actions/runs/38909447175)
+  passed on Windows, Linux and macOS for code commit
+  `4d33b94b8c11d57e2468ff6e11b9252e049f4a57`. The macOS 15.7.9 ARM64 runner
+  passed all 16 tests, including Apple clang cross-compiling a minimal
+  x86_64 kext and parsing its vtable. Windows and Linux skip that compiler
+  test. This is not a test of loading the driver on Apple Silicon.
+  Neither a full NVIDIA driver build nor a Tahoe boot/render/sleep test
+  was performed.
 
 ## Required before calling a driver build validated on Tahoe
 
