@@ -1,0 +1,25 @@
+name: Tahoe compatibility tools
+
+on:
+  push:
+    branches: [codex/tahoe-compat-checks]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test Mach-O parsing and Tahoe forwarding generation
+        run: python tools/test_tahoe_tools.py -v
